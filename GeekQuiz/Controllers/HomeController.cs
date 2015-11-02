@@ -22,6 +22,7 @@ using System.Web.Mvc;
 
 namespace GeekQuiz.Controllers
 {
+    [RequireHttps]
     [Authorize]
     public class HomeController : Controller
     {

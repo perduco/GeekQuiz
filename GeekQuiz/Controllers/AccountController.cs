@@ -25,23 +25,37 @@ using Microsoft.AspNet.Identity;
 using Microsoft.AspNet.Identity.EntityFramework;
 using Microsoft.Owin.Security;
 using GeekQuiz.Models;
+using Microsoft.AspNet.Identity.Owin;
+using GeekQuiz.App_Start;
+using Microsoft.Owin.Security.Cookies;
 
 namespace GeekQuiz.Controllers
 {
     [Authorize]
     public class AccountController : Controller
     {
+        private ApplicationUserManager _userManager;
+
         public AccountController()
-            : this(new UserManager<ApplicationUser>(new UserStore<ApplicationUser>(new ApplicationDbContext())))
         {
         }
 
-        public AccountController(UserManager<ApplicationUser> userManager)
+        public AccountController(ApplicationUserManager userManager)
         {
             UserManager = userManager;
         }
 
-        public UserManager<ApplicationUser> UserManager { get; private set; }
+        public ApplicationUserManager UserManager
+        {
+            get
+            {
+                return _userManager ?? HttpContext.GetOwinContext().GetUserManager<ApplicationUserManager>();
+            }
+            private set
+            {
+                _userManager = value;
+            }
+        }
 
         //
         // GET: /Account/Login
@@ -218,11 +232,20 @@ namespace GeekQuiz.Controllers
                 return RedirectToAction("Login");
             }
 
-            // Sign in the user with this external login provider if the user already has a login
             var user = await UserManager.FindAsync(loginInfo.Login);
             if (user != null)
             {
-                await SignInAsync(user, isPersistent: false);
+                var claims = new List<Claim>();
+                var tenantClaim = loginInfo.ExternalIdentity.Claims.SingleOrDefault(a => a.Type == Startup.TenantClaimType);
+                var b2cClaim = loginInfo.ExternalIdentity.Claims.SingleOrDefault(a => a.Type == Startup.AcrClaimType);
+
+                if (tenantClaim != null)
+                    claims.Add(tenantClaim);
+
+                if (b2cClaim != null)
+                    claims.Add(b2cClaim);
+
+                await SignInAsync(user, false, claims.ToArray());
                 return RedirectToLocal(returnUrl);
             }
             else
@@ -248,6 +271,7 @@ namespace GeekQuiz.Controllers
         // GET: /Account/LinkLoginCallback
         public async Task<ActionResult> LinkLoginCallback()
         {
+            var user = User.Identity.GetUserId();
             var loginInfo = await AuthenticationManager.GetExternalLoginInfoAsync(XsrfKey, User.Identity.GetUserId());
             if (loginInfo == null)
             {
@@ -305,7 +329,22 @@ namespace GeekQuiz.Controllers
         [ValidateAntiForgeryToken]
         public ActionResult LogOff()
         {
-            AuthenticationManager.SignOut();
+            Dictionary<string, string> dict = new Dictionary<string, string>();
+            if (ClaimsPrincipal.Current.FindFirst(Startup.AcrClaimType) != null)
+            {
+                dict[B2COpenIdConnectAuthenticationHandler.PolicyParameter] = ClaimsPrincipal.Current.FindFirst(Startup.AcrClaimType).Value;
+                HttpContext.GetOwinContext().Authentication.SignOut(
+                    new AuthenticationProperties(dict),
+                    "B2C", CookieAuthenticationDefaults.AuthenticationType);
+            }
+            else if (ClaimsPrincipal.Current.FindFirst(Startup.TenantClaimType) != null)
+            {
+                HttpContext.GetOwinContext().Authentication.SignOut(
+                    new AuthenticationProperties(dict),
+                    "AAD", CookieAuthenticationDefaults.AuthenticationType);
+            }
+
+            AuthenticationManager.SignOut(DefaultAuthenticationTypes.ExternalCookie, DefaultAuthenticationTypes.ApplicationCookie);
             return RedirectToAction("Index", "Home");
         }
 
@@ -349,8 +388,20 @@ namespace GeekQuiz.Controllers
 
         private async Task SignInAsync(ApplicationUser user, bool isPersistent)
         {
+            await SignInAsync(user, isPersistent, null);
+        }
+
+        private async Task SignInAsync(ApplicationUser user, bool isPersistent, Claim[] claims)
+        {
             AuthenticationManager.SignOut(DefaultAuthenticationTypes.ExternalCookie);
             var identity = await UserManager.CreateIdentityAsync(user, DefaultAuthenticationTypes.ApplicationCookie);
+            if (claims != null)
+            {
+                foreach(Claim claim in claims)
+                {
+                    identity.AddClaim(claim);
+                }
+            }
             AuthenticationManager.SignIn(new AuthenticationProperties() { IsPersistent = isPersistent }, identity);
         }
 
@@ -411,7 +462,15 @@ namespace GeekQuiz.Controllers
 
             public override void ExecuteResult(ControllerContext context)
             {
-                var properties = new AuthenticationProperties() { RedirectUri = RedirectUri };
+                var properties = new AuthenticationProperties(new Dictionary<string, string>
+                {
+                    {
+                        B2COpenIdConnectAuthenticationHandler.PolicyParameter, Startup.SignInPolicyId
+                    }
+                })
+                {
+                    RedirectUri = RedirectUri
+                };
                 if (UserId != null)
                 {
                     properties.Dictionary[XsrfKey] = UserId;
